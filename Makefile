@@ -5,11 +5,15 @@
 # Call to return the first non-empty value from "go env" or a default value.
 getgoenv = $(firstword $(foreach e,$(1),$(shell go env $(e))) $(2))
 
+# Call to return each instance of a subpath in each given parent paths.
+each = $(wildcard $(addsuffix $(2),$(subst :, ,$(1))))
+which = $(firstword $(call each,$(1),$(2)))
+
 ifeq "cygwin" "$(shell uname -o | tr 'A-Z' 'a-z')"
-  cygoroot := $(shell cygpath --windows --long-name --absolute $(GOROOT))
-  cygopath := $(shell cygpath --windows --long-name --absolute $(GOPATH))
-  GOROOT   := $(shell cygpath --unix --absolute "$(call getgoenv,GOROOT,)")
-  GOPATH   := $(shell cygpath --unix --absolute "$(call getgoenv,GOPATH,)")
+  cygoroot := $(shell cygpath --windows --long-name --absolute $(call getgoenv,GOROOT,$(GOROOT)))
+  cygopath := $(shell cygpath --windows --long-name --absolute $(call getgoenv,GOPATH,$(GOPATH)))
+  GOROOT   := $(shell cygpath --unix --absolute "$(cygoroot)")
+  GOPATH   := $(shell cygpath --unix --absolute "$(cygopath)")
 endif
 
 # Verify we have a valid GOPATH, GOROOT that physically exist.
@@ -40,7 +44,7 @@ endif
 
 PROJECT   ?= apssvn
 IMPORT    ?= github.com/ardnew/$(PROJECT)
-VERSION   ?= 0.1.0
+VERSION   ?= 0.2.1
 BUILDTIME ?= $(shell date -u '+%FT%TZ')
 # If not defined, guess PLATFORM from current GOOS/GOHOSTOS, GOARCH/GOHOSTARCH.
 # When none of these are set, fallback on linux-amd64.
@@ -48,7 +52,7 @@ PLATFORM  ?=                                                                   \
   $(call getgoenv,GOOS GOHOSTOS,linux)-$(call getgoenv,GOARCH GOHOSTARCH,amd64)
 
 # Determine Git branch and revision (if metadata exists).
-ifneq "" "$(wildcard $(GOPATH)/src/$(IMPORT)/.git)"
+ifneq "" "$(GOPATH)/src/$(IMPORT)/.git"
   # Verify we have the Git executable installed on our PATH.
   ifneq "" "$(shell which git)"
     BRANCH   ?= $(shell git symbolic-ref --short HEAD)

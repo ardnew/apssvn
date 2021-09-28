@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode"
 )
 
 var (
@@ -30,10 +31,24 @@ const (
 	svnURLRoot     = "svn"
 )
 
+const newline = "\r\n"
+
+func exeName() string {
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Base(exe)
+	}
+	return filepath.Base(os.Args[0])
+}
+
 func usage(set *flag.FlagSet) {
-	fmt.Printf("%s version %s (%s@%s %s) %s\n",
-		IMPORT, VERSION, BRANCH, REVISION, PLATFORM, BUILDTIME)
+	fmt.Println(ln(fmt.Sprintf("%s %s %s %s@%s %s",
+		IMPORT, VERSION, PLATFORM, BRANCH, REVISION, BUILDTIME)))
+	fmt.Println("USAGE")
+	fmt.Println(ln(fmt.Sprintf("  %s [flags] [filter-regexp ...] [-- svn-command ...]",
+		exeName())))
+	fmt.Println("FLAGS")
 	set.PrintDefaults()
+	fmt.Println()
 }
 
 func main() {
@@ -41,11 +56,12 @@ func main() {
 	defRepoPath := repoFilePath(repoFileName)
 	defBaseURL := serverAddrPort
 
+	argMatchAny := flag.Bool("a", false, "use logical-OR matching with all given arguments (default \"logical-AND\")")
 	//argBrowse := flag.Bool("b", false, "open Web URL with Web browser")
 	argCaseSen := flag.Bool("c", false, "use case-sensitive matching")
 	argDryRun := flag.Bool("d", false, "print commands which would be executed (dry-run)")
 	argRepoFile := flag.String("f", defRepoPath, "use repository definitions from `file`")
-	argMatchAny := flag.Bool("o", false, "use logical-OR matching with all given arguments (default \"logical-AND\")")
+	argOutPath := flag.String("o", "", "output `path` for commands that accept it (checkout, export, etc.)")
 	argRelPath := flag.String("p", "", "append `path` to all constructed URLs")
 	argBaseURL := flag.String("s", defBaseURL, "prepend `server` to all constructed URLs")
 	argWebURL := flag.Bool("w", false, "construct Web URLs instead of repository URLs")
@@ -81,9 +97,9 @@ func main() {
 	*argBaseURL = strings.TrimRight(*argBaseURL, "/")
 	*argRelPath = strings.TrimLeft(*argRelPath, "/")
 
-	rootURL := svnURLRoot
+	urlRoot := svnURLRoot
 	if *argWebURL {
-		rootURL = webURLRoot
+		urlRoot = webURLRoot
 	}
 
 	procMatch := func(match []string) {
@@ -92,16 +108,20 @@ func main() {
 				if *argRelPath != "" {
 					rep = fmt.Sprintf("%s/%s", rep, *argRelPath)
 				}
-				fmt.Printf("%s/%s/%s", *argBaseURL, rootURL, rep)
+				fmt.Printf("%s/%s/%s", *argBaseURL, urlRoot, rep)
 				fmt.Println()
 			}
 		} else {
 			for _, rep := range match {
+				var outPath string
 				if *argRelPath != "" {
 					rep = fmt.Sprintf("%s/%s", rep, *argRelPath)
 				}
-				repo := fmt.Sprintf("%s/%s/%s", *argBaseURL, rootURL, rep)
+				repo := fmt.Sprintf("%s/%s/%s", *argBaseURL, urlRoot, rep)
 				if len(match) > 0 {
+					if *argOutPath != "" {
+						outPath = outputPath(*argOutPath, rep)
+					}
 					// Print the command line being executed
 					var sb strings.Builder
 					sb.WriteString("| svn")
@@ -111,11 +131,15 @@ func main() {
 					}
 					sb.WriteRune(' ')
 					sb.WriteString(repo)
+					if outPath != "" {
+						sb.WriteRune(' ')
+						sb.WriteString(outPath)
+					}
 					log.Println(sb.String())
 				}
 				if !*argDryRun {
-					out, err := run(repo, cmdArg...)
-					if out.Len() > 0 {
+					out, err := run(repo, outPath, cmdArg...)
+					if out != nil && out.Len() > 0 {
 						fmt.Print(out.String())
 					}
 					switch {
@@ -135,7 +159,7 @@ func main() {
 			if *argRelPath != "" {
 				rep = Repo(fmt.Sprintf("%s/%s", rep, *argRelPath))
 			}
-			fmt.Printf("%s/%s/%s", *argBaseURL, rootURL, rep)
+			fmt.Printf("%s/%s/%s", *argBaseURL, urlRoot, rep)
 			fmt.Println()
 		}
 	} else {
@@ -162,18 +186,25 @@ func main() {
 	}
 }
 
-func run(repo string, arg ...string) (*strings.Builder, error) {
+func outputPath(pattern, repo string) string {
+	// TODO: support keyword expansion?
+	return pattern
+}
+
+func run(repo, out string, arg ...string) (*strings.Builder, error) {
+	if err := os.MkdirAll(out, 0755); err != nil {
+		return nil, err
+	}
 	var b, e strings.Builder
-	cmd := exec.Command("svn", append(arg, repo)...)
+	cmd := exec.Command("svn", append(arg, repo, out)...)
 	cmd.Stdout = &b
 	cmd.Stderr = &e
 	err := cmd.Run()
 	if e.Len() > 0 {
 		if err != nil {
-			err = fmt.Errorf("%w\r\n%s", err, strings.TrimSpace(e.String()))
-		} else {
-			err = errors.New(strings.TrimSpace(e.String()))
+			return &b, fmt.Errorf("%w\r\n%s", err, strings.TrimSpace(e.String()))
 		}
+		return &b, errors.New(strings.TrimSpace(e.String()))
 	}
 	return &b, err
 }
@@ -259,4 +290,48 @@ func (l *RepoList) matches(pat []string, sen bool) ([]string, error) {
 	}
 
 	return m, nil
+}
+
+func ln(word ...string) string {
+	var sb strings.Builder
+	var rp []rune
+	var pp bool
+	for i, w := range word {
+		if len(w) > 0 {
+			// No visible symbols exist after this word
+			last := (i+1 == len(word)) ||
+				(strings.TrimSpace(strings.Join(word[i+1:], "")) == "")
+			// Word is non-empty
+			if t := strings.TrimSpace(w); t != "" {
+				// Word contains a visible symbol
+				rw, rt := []rune(w), []rune(t)
+				// Word is the first word being added
+				first := sb.Len() == 0
+				// Word is a punctuation character
+				punct := (len(rt) == 1) && unicode.IsPunct(rt[0])
+				// Word begins with whitespace
+				wsBeg := unicode.IsSpace(rw[0])
+				// Previous word ends with whitespace
+				wsEnd := (len(rp) > 0) && unicode.IsSpace(rp[len(rp)-1])
+				if !first && !punct && !wsBeg && !wsEnd {
+					sb.WriteRune(' ')
+				}
+				if pp = punct; pp {
+					sb.WriteString(t)
+				} else {
+					if last {
+						// Trim trailing whitespace from last word
+						sb.WriteString(w[:strings.LastIndex(w, t)+len(t)])
+					} else {
+						sb.WriteString(w)
+					}
+				}
+				rp = rw
+			}
+			if last {
+				break
+			}
+		}
+	}
+	return strings.TrimRight(sb.String(), "\r\n") + newline
 }
