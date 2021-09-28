@@ -192,8 +192,10 @@ func outputPath(pattern, repo string) string {
 }
 
 func run(repo, out string, arg ...string) (*strings.Builder, error) {
-	if err := os.MkdirAll(out, 0755); err != nil {
-		return nil, err
+	if out != "" {
+		if err := os.MkdirAll(out, 0755); err != nil {
+			return nil, err
+		}
 	}
 	var b, e strings.Builder
 	cmd := exec.Command("svn", append(arg, repo, out)...)
