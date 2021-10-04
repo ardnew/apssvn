@@ -220,6 +220,9 @@ func outputPath(pattern, repo, relPath string) string {
 		}
 		pattern = s
 	}
+	for k := range sub {
+		pattern = strings.ReplaceAll(pattern, "\\"+string(k), string(k))
+	}
 	return pattern
 }
 
