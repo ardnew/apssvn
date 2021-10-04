@@ -56,12 +56,12 @@ func main() {
 	defRepoPath := repoFilePath(repoFileName)
 	defBaseURL := serverAddrPort
 
-	argMatchAny := flag.Bool("a", false, "use logical-OR matching with all given arguments (default \"logical-AND\")")
+	argMatchAny := flag.Bool("a", false, "select repositories matching any given individual argument")
 	//argBrowse := flag.Bool("b", false, "open Web URL with Web browser")
 	argCaseSen := flag.Bool("c", false, "use case-sensitive matching")
-	argDryRun := flag.Bool("d", false, "print commands which would be executed (dry-run)")
+	argDryRun := flag.Bool("d", false, "do nothing but print commands which would be executed (dry-run)")
 	argRepoFile := flag.String("f", defRepoPath, "use repository definitions from `file`")
-	argOutPath := flag.String("o", "", "output `path` for commands that accept it (checkout, export, etc.)")
+	argOutPath := flag.String("o", "", "command output `path` (variables: @=repo, ^=relpath, %=repo/relpath)")
 	argRelPath := flag.String("p", "", "append `path` to all constructed URLs")
 	argBaseURL := flag.String("s", defBaseURL, "prepend `server` to all constructed URLs")
 	argWebURL := flag.Bool("w", false, "construct Web URLs instead of repository URLs")
@@ -114,13 +114,14 @@ func main() {
 		} else {
 			for _, rep := range match {
 				var outPath string
+				base := rep
 				if *argRelPath != "" {
 					rep = fmt.Sprintf("%s/%s", rep, *argRelPath)
 				}
 				repo := fmt.Sprintf("%s/%s/%s", *argBaseURL, urlRoot, rep)
 				if len(match) > 0 {
 					if *argOutPath != "" {
-						outPath = outputPath(*argOutPath, rep)
+						outPath = outputPath(*argOutPath, base, *argRelPath)
 					}
 					// Print the command line being executed
 					var sb strings.Builder
@@ -186,8 +187,39 @@ func main() {
 	}
 }
 
-func outputPath(pattern, repo string) string {
-	// TODO: support keyword expansion?
+func outputPath(pattern, repo, relPath string) string {
+	const maxSubs = 100 // surely you can't be serious.
+	sub := map[rune]string{
+		// disallow keywords from infinitely substituting itself. this doesn't
+		// prevent mutually-infinite recursion. don't call me shirley.
+		'@': strings.ReplaceAll(repo, "@", "\\@"),
+		'^': strings.ReplaceAll(relPath, "^", "\\^"),
+		'%': strings.ReplaceAll(filepath.Join(repo, relPath), "%", "\\%"),
+	}
+	expand := func(s string) (string, bool) {
+		didExpand := false
+		for k, v := range sub {
+			b := strings.Builder{}
+			e := []rune(s)
+			for i, r := range e {
+				if r == k && (i < 1 || e[i-1] != '\\') {
+					b.WriteString(v)
+					didExpand = true
+				} else {
+					b.WriteRune(r)
+				}
+			}
+			s = b.String()
+		}
+		return s, didExpand
+	}
+	for i := 0; i < maxSubs; i++ {
+		s, didExpand := expand(pattern)
+		if !didExpand {
+			break
+		}
+		pattern = s
+	}
 	return pattern
 }
 
