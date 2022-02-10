@@ -226,6 +226,16 @@ func outputPath(pattern, repo, relPath string) string {
 	return pattern
 }
 
+func nonEmpty(arg ...string) []string {
+	result := make([]string, 0, len(arg))
+	for _, s := range arg {
+		if t := strings.TrimSpace(s); t != "" {
+			result = append(result, s) // keep the untrimmed original
+		}
+	}
+	return result
+}
+
 func run(repo, out string, arg ...string) (*strings.Builder, error) {
 	if out != "" {
 		if err := os.MkdirAll(out, 0755); err != nil {
@@ -233,7 +243,7 @@ func run(repo, out string, arg ...string) (*strings.Builder, error) {
 		}
 	}
 	var b, e strings.Builder
-	cmd := exec.Command("svn", append(arg, repo, out)...)
+	cmd := exec.Command("svn", append(arg, nonEmpty(repo, out)...)...)
 	cmd.Stdout = &b
 	cmd.Stderr = &e
 	err := cmd.Run()
