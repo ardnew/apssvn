@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -63,11 +64,16 @@ func main() {
 	argRepoFile := flag.String("f", defRepoPath, "use repository definitions from `file`")
 	argOutPath := flag.String("o", "", "command output `path` (variables: @=repo, ^=relpath, %=repo/relpath)")
 	argRelPath := flag.String("p", "", "append `path` to all constructed URLs")
+	argQuiet := flag.Bool("q", false, "Suppress all non-essential and error messages (quiet)")
 	argBaseURL := flag.String("s", defBaseURL, "prepend `server` to all constructed URLs")
 	argWebURL := flag.Bool("w", false, "construct Web URLs instead of repository URLs")
 	flag.Usage = func() { usage(flag.CommandLine) }
 
 	flag.Parse()
+
+	if *argQuiet {
+		log.SetOutput(io.Discard)
+	}
 
 	expArg := []string{}
 	cmdArg := []string{}
