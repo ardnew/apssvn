@@ -45,10 +45,32 @@ func usage(set *flag.FlagSet) {
 	fmt.Println(ln(fmt.Sprintf("%s %s %s %s@%s %s",
 		IMPORT, VERSION, PLATFORM, BRANCH, REVISION, BUILDTIME)))
 	fmt.Println("USAGE")
-	fmt.Println(ln(fmt.Sprintf("  %s [flags] [filter-regexp ...] [-- svn-command ...]",
+	fmt.Println(ln(fmt.Sprintf("  %s [flags] [filter-regexp ...] [-- svn-command ...] [+path]",
 		exeName())))
 	fmt.Println("FLAGS")
 	set.PrintDefaults()
+	fmt.Println()
+	fmt.Println("NOTES")
+	fmt.Printf(ln("  The \"flag\" package in Go's standard library requires all option flags be"))
+	fmt.Printf(ln("  specified preceding all non-flag arguments. The non-flag arguments of %s"), exeName())
+	fmt.Printf(ln("  however are used to express svn subcommands, which often accept file paths as"))
+	fmt.Printf(ln("  their trailing arguments. This conflict results in an awkward %s command-line"), exeName())
+	fmt.Printf(ln("  syntax where the target path of svn subcommands ('-p' flag) must be expressed"))
+	fmt.Printf(ln("  near the front of the command-line, and the svn subcommand is expressed at the"))
+	fmt.Printf(ln("  end. For example:"))
+	fmt.Println()
+	fmt.Printf(ln("    %s -p branches/b ^foo -- ls -v       // svn ls -v <REPO>/branches/b"), exeName())
+	fmt.Println()
+	fmt.Printf(ln("  Thus, to change the path given to \"svn ls\", the user must navigate to the front"))
+	fmt.Printf(ln("  of the command-line and edit the argument given to flag '-p'. To address this"))
+	fmt.Printf(ln("  frustration, an alternative syntax may be provided. Ignore the '-p' flag entirely."))
+	fmt.Printf(ln("  Instead, anywhere in the svn subcommand (that is, anywhere following the"))
+	fmt.Printf(ln("  end-of-options delimiter '--'), you may specify a file path by prefixing it with a"))
+	fmt.Printf(ln("  single '+'. This allows the user to place the path at the end of the command-line"))
+	fmt.Printf(ln("  for convenient repeated editing, or anywhere within the svn subcommand that feels"))
+	fmt.Printf(ln("  most natural. The example above could instead be expressed as:"))
+	fmt.Println()
+	fmt.Printf(ln("    %s ^foo -- ls -v +branches/b"), exeName())
 	fmt.Println()
 }
 
@@ -63,8 +85,8 @@ func main() {
 	argDryRun := flag.Bool("d", false, "do nothing but print commands which would be executed (dry-run)")
 	argRepoFile := flag.String("f", defRepoPath, "use repository definitions from `file`")
 	argOutPath := flag.String("o", "", "command output `path` (variables: @=repo, ^=relpath, %=repo/relpath)")
-	argRelPath := flag.String("p", "", "append `path` to all constructed URLs")
-	argQuiet := flag.Bool("q", false, "Suppress all non-essential and error messages (quiet)")
+	argRelPath := flag.String("p", "", "append `path` to all constructed URLs (see NOTES for alternative)")
+	argQuiet := flag.Bool("q", false, "suppress all non-essential and error messages (quiet)")
 	argBaseURL := flag.String("s", defBaseURL, "prepend `server` to all constructed URLs")
 	argWebURL := flag.Bool("w", false, "construct Web URLs instead of repository URLs")
 	flag.Usage = func() { usage(flag.CommandLine) }
@@ -74,9 +96,6 @@ func main() {
 	if *argQuiet {
 		log.SetOutput(io.Discard)
 	}
-
-	expArg := []string{}
-	cmdArg := []string{}
 
 	var expLen, cmdPos int
 	for i, a := range flag.Args() {
@@ -88,11 +107,29 @@ func main() {
 		}
 		expLen++
 	}
+
+	var expArg, cmdArg []string
+
 	if expLen > 0 {
 		expArg = flag.Args()[:expLen]
 	}
 	if cmdPos > 0 {
 		cmdArg = flag.Args()[cmdPos:]
+	}
+
+	// If user provides a path with "+" prefix anywhere in the command arguments,
+	// use it as the argRelPath flag value. This makes path specification much
+	// more convenient, without having to traverse back to the beginning of the
+	// command line to change paths.
+	for i, s := range cmdArg {
+		if s[0] == '+' && len(s) > 1 {
+			*argRelPath = s[1:]
+			if len(cmdArg) > i+1 {
+				copy(cmdArg[i:], cmdArg[i+1:])
+			}
+			cmdArg = cmdArg[:len(cmdArg)-1]
+			break
+		}
 	}
 
 	list, err := NewRepoList(*argRepoFile)
