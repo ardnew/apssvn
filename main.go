@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"os/exec"
@@ -13,6 +14,8 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+
+	"github.com/go-resty/resty/v2"
 )
 
 var (
@@ -26,11 +29,29 @@ var (
 )
 
 const (
-	repoFileName   = ".apsrepo"
-	serverAddrPort = "http://rstok3-dev02:3690"
-	webURLRoot     = "viewvc"
-	svnURLRoot     = "svn"
+	repoFileName = ".apsrepo"
+	hostName     = "rstok3-dev02"
+	cacheName    = "CollabNet Subversion Repository"
+	svnAddrPort  = "http://" + hostName + ":3690"
+	apiAddrPort  = "http://" + hostName + ":3343"
+	apiVersion   = "1"
+	webURLRoot   = "viewvc"
+	svnURLRoot   = "svn"
+	apiURLRoot   = "csvn/api/" + apiVersion
+	apiFormat    = "json"
 )
+
+type apiRespRepo struct {
+	Repo []apiRepo `json:"repositories"`
+}
+
+type apiRepo struct {
+	ID      int    `json:"id"`
+	Name    string `json:"name"`
+	RepoURL string `json:"svnUrl"`
+	ViewURL string `json:"viewvcUrl"`
+	Status  string `json:"status"`
+}
 
 const newline = "\r\n"
 
@@ -77,17 +98,19 @@ func usage(set *flag.FlagSet) {
 func main() {
 
 	defRepoPath := repoFilePath(repoFileName)
-	defBaseURL := serverAddrPort
+	defBaseURL := svnAddrPort
 
 	argMatchAny := flag.Bool("a", false, "select repositories matching any given individual argument")
 	//argBrowse := flag.Bool("b", false, "open Web URL with Web browser")
 	argCaseSen := flag.Bool("c", false, "use case-sensitive matching")
 	argDryRun := flag.Bool("d", false, "do nothing but print commands which would be executed (dry-run)")
 	argRepoFile := flag.String("f", defRepoPath, "use repository definitions from `file`")
+	argLogin := flag.String("l", "", "use `user:pass` to authenticate with REST API")
 	argOutPath := flag.String("o", "", "command output `path` (variables: @=repo, ^=relpath, %=repo/relpath)")
 	argRelPath := flag.String("p", "", "append `path` to all constructed URLs (see NOTES for alternative)")
 	argQuiet := flag.Bool("q", false, "suppress all non-essential and error messages (quiet)")
 	argBaseURL := flag.String("s", defBaseURL, "prepend `server` to all constructed URLs")
+	argUpdate := flag.Bool("u", false, "update repository definitions from server")
 	argWebURL := flag.Bool("w", false, "construct Web URLs instead of repository URLs")
 	flag.Usage = func() { usage(flag.CommandLine) }
 
@@ -95,6 +118,9 @@ func main() {
 
 	if *argQuiet {
 		log.SetOutput(io.Discard)
+	} else {
+		log.SetFlags(log.LstdFlags | log.Lmsgprefix)
+		log.SetPrefix("| ")
 	}
 
 	var expLen, cmdPos int
@@ -132,7 +158,18 @@ func main() {
 		}
 	}
 
-	list, err := NewRepoList(*argRepoFile)
+	user, pass := "", ""
+	if *argLogin != "" {
+		s := strings.SplitN(*argLogin, ":", 2)
+		if len(s) > 0 {
+			user = s[0]
+		}
+		if len(s) > 1 {
+			pass = s[1]
+		}
+	}
+
+	list, err := NewRepoList(*argRepoFile, *argUpdate, user, pass)
 	if nil != err {
 		log.Fatalln(err)
 	}
@@ -327,10 +364,95 @@ func repoFilePath(name string) string {
 	return filepath.Join(".", name)
 }
 
+func cachedCredentials() (user string, pass string, err error) {
+	c := exec.Command("svn", "auth", "--show-passwords", cacheName)
+	r, err := regexp.Compile(`(?mi)^(Password|Username):\s*(.*)$`)
+	if nil != err {
+		return "", "", err
+	}
+	e := errors.New("SVN credentials not cached (see -h for help authenticating)")
+	o, err := c.CombinedOutput()
+	if nil != err {
+		return "", "", e
+	}
+	s := r.FindAllSubmatch(o, 2)
+	if s == nil {
+		return "", "", e
+	}
+	for _, u := range s {
+		switch strings.ToLower(string(u[1])) {
+		case "username":
+			user = string(u[2])
+		case "password":
+			pass = string(u[2])
+		}
+	}
+	return
+}
+
+func updateRepoFile(filePath string, user string, pass string) (*os.File, error) {
+
+	api := resty.New().
+		SetDisableWarn(true).
+		SetRetryCount(3).
+		SetHostURL(apiAddrPort + "/" + apiURLRoot)
+
+	if user == "" && pass == "" {
+		var err error
+		user, pass, err = cachedCredentials()
+		if nil != err {
+			return nil, err
+		}
+	}
+	api.SetBasicAuth(user, pass)
+
+	resp := apiRespRepo{}
+	_, err := api.R().
+		SetHeader("Accept", "application/"+apiFormat).
+		SetQueryParams(map[string]string{"format": apiFormat}).
+		SetResult(&resp).
+		Get("/repository")
+	if nil != err {
+		return nil, err
+	}
+	log.Printf("received %d repositories\n", len(resp.Repo))
+
+	// first write the response to a temporary file and then move it in place of
+	// our selected repo definitions file. in case of an error, we won't lose an
+	// existing repo definitions file.
+	repoFile, err := os.CreateTemp("", repoFileName)
+	if nil != err {
+		return nil, err
+	}
+	defer repoFile.Close()
+
+	for _, r := range resp.Repo {
+		if _, err := fmt.Fprintln(repoFile, r.Name); nil != err {
+			return nil, err
+		}
+	}
+
+	return repoFile, nil
+}
+
 type Repo string
 type RepoList []Repo
 
-func NewRepoList(filePath string) (*RepoList, error) {
+func NewRepoList(filePath string, update bool, user string, pass string) (*RepoList, error) {
+
+	if update {
+		// write all repos to a new temporary file
+		tmp, err := updateRepoFile(filePath, user, pass)
+		if nil != err {
+			return nil, err
+		}
+		// ensure our target repo file path exists
+		if err := os.MkdirAll(filepath.Dir(filePath), fs.ModePerm); nil != err {
+			return nil, err
+		}
+		// move the temporary file in place of our given definitions file
+		os.Rename(tmp.Name(), filePath)
+	}
 
 	file, err := os.Open(filePath)
 	if nil != err {

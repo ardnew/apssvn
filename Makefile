@@ -44,7 +44,7 @@ endif
 
 PROJECT   ?= apssvn
 IMPORT    ?= github.com/ardnew/$(PROJECT)
-VERSION   ?= 0.3.4
+VERSION   ?= 0.4.0
 BUILDTIME ?= $(shell date -u '+%FT%TZ')
 # If not defined, guess PLATFORM from current GOOS/GOHOSTOS, GOARCH/GOHOSTARCH.
 # When none of these are set, fallback on linux-amd64.

@@ -1,0 +1,5 @@
+go.sum
+run.sh
+bin
+.gdb_history
+.Makefile.targets
