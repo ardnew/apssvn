@@ -1,21 +1,18 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"unicode"
 
-	"github.com/go-resty/resty/v2"
+	"github.com/ardnew/apssvn/cache"
 )
 
 var (
@@ -29,28 +26,26 @@ var (
 )
 
 const (
-	repoFileName = ".apsrepo"
-	hostName     = "rstok3-dev02"
-	cacheName    = "CollabNet Subversion Repository"
-	svnAddrPort  = "http://" + hostName + ":3690"
-	apiAddrPort  = "http://" + hostName + ":3343"
-	apiVersion   = "1"
-	webURLRoot   = "viewvc"
-	svnURLRoot   = "svn"
-	apiURLRoot   = "csvn/api/" + apiVersion
-	apiFormat    = "json"
+	cacheName   = ".apsrepo"
+	hostName    = "rstok3-dev02"
+	svnAddrPort = "http://" + hostName + ":3690"
+	webURLRoot  = "viewvc"
+	svnURLRoot  = "svn"
 )
 
-type apiRespRepo struct {
-	Repo []apiRepo `json:"repositories"`
+type repoPattern []string
+
+func (rp *repoPattern) Set(s string) error {
+	if rp == nil {
+		*rp = repoPattern{s}
+	} else {
+		*rp = append(*rp, s)
+	}
+	return nil
 }
 
-type apiRepo struct {
-	ID      int    `json:"id"`
-	Name    string `json:"name"`
-	RepoURL string `json:"svnUrl"`
-	ViewURL string `json:"viewvcUrl"`
-	Status  string `json:"status"`
+func (rp *repoPattern) String() string {
+	return "[ " + strings.Join(*rp, ", ") + " ]"
 }
 
 const newline = "\r\n"
@@ -63,55 +58,74 @@ func exeName() string {
 }
 
 func usage(set *flag.FlagSet) {
-	fmt.Println(ln(fmt.Sprintf("%s %s %s %s@%s %s",
-		IMPORT, VERSION, PLATFORM, BRANCH, REVISION, BUILDTIME)))
+	ww := &wordWrap{column: 80, indent: "  ", indentFirst: true}
+	fmt.Printf("%s %s %s %s@%s %s"+newline,
+		IMPORT, VERSION, PLATFORM, BRANCH, REVISION, BUILDTIME)
 	fmt.Println("USAGE")
-	fmt.Println(ln(fmt.Sprintf("  %s [flags] [filter-regexp ...] [-- svn-command ...] [+path]",
-		exeName())))
-	fmt.Println("FLAGS")
-	set.PrintDefaults()
+	fmt.Printf(ww.wrap(exeName(), "[flags] [-- svn-command-line ...]"))
+	fmt.Println()
+	fmt.Println("FLAGS (mnemonics shown in [brackets])")
+	// Determine the maximum width of the left-hand side containing "-x foo" among
+	// all defined flags
+	margin := 0
+	set.VisitAll(func(f *flag.Flag) {
+		name, _ := flag.UnquoteUsage(f)
+		if width := len(name) + len(f.Name); width > margin {
+			margin = width
+		}
+	})
+	ww.indentFirst = false
+	ww.indent = fmt.Sprintf("  %*s ", margin+4, "")
+	set.VisitAll(func(f *flag.Flag) {
+		name, desc := flag.UnquoteUsage(f)
+		flagName := fmt.Sprintf("-%s %s", f.Name, name)
+		ww.caption = fmt.Sprintf("  %-*s ", margin+4, flagName)
+		fmt.Printf(ww.wrap(desc))
+	})
+	ww.indentFirst = true
+	ww.indent = "  "
+	ww.caption = ""
 	fmt.Println()
 	fmt.Println("NOTES")
-	fmt.Printf(ln("  The \"flag\" package in Go's standard library requires all option flags be"))
-	fmt.Printf(ln("  specified preceding all non-flag arguments. The non-flag arguments of %s"), exeName())
-	fmt.Printf(ln("  however are used to express svn subcommands, which often accept file paths as"))
-	fmt.Printf(ln("  their trailing arguments. This conflict results in an awkward %s command-line"), exeName())
-	fmt.Printf(ln("  syntax where the target path of svn subcommands ('-p' flag) must be expressed"))
-	fmt.Printf(ln("  near the front of the command-line, and the svn subcommand is expressed at the"))
-	fmt.Printf(ln("  end. For example:"))
+	fmt.Printf(ww.wrap("All arguments following the first occurrence of \"--\" are",
+		"forwarded (in the same order they were given) to each \"svn\" command",
+		"generated. Since the same command may run with multiple repositories,",
+		"placeholder variables are used in the given command line and substituted",
+		"with attributes from each target repository:"))
 	fmt.Println()
-	fmt.Printf(ln("    %s -p branches/b ^foo -- ls -v       // svn ls -v <REPO>/branches/b"), exeName())
+	ww.indent = "      "
+	fmt.Printf(ww.wrap("@ = repository URL (must be first character in word)"))
+	fmt.Printf(ww.wrap("^ = repository base name"))
+	ww.indent = "  "
 	fmt.Println()
-	fmt.Printf(ln("  Thus, to change the path given to \"svn ls\", the user must navigate to the front"))
-	fmt.Printf(ln("  of the command-line and edit the argument given to flag '-p'. To address this"))
-	fmt.Printf(ln("  frustration, an alternative syntax may be provided. Ignore the '-p' flag entirely."))
-	fmt.Printf(ln("  Instead, anywhere in the svn subcommand (that is, anywhere following the"))
-	fmt.Printf(ln("  end-of-options delimiter '--'), you may specify a file path by prefixing it with a"))
-	fmt.Printf(ln("  single '+'. This allows the user to place the path at the end of the command-line"))
-	fmt.Printf(ln("  for convenient repeated editing, or anywhere within the svn subcommand that feels"))
-	fmt.Printf(ln("  most natural. The example above could instead be expressed as:"))
+	fmt.Printf(ww.wrap("For example, exporting a common tag from all repositories",
+		"with \"DAPA\" in the name into respectively-named subdirectories:"))
 	fmt.Println()
-	fmt.Printf(ln("    %s ^foo -- ls -v +branches/b"), exeName())
+	ww.indent = "      "
+	fmt.Printf(ww.wrap("%%", exeName(), "-r DAPA -- export @/tags/foo ^/tags/foo"))
+	ww.indent = "  "
 	fmt.Println()
 }
 
 func main() {
 
-	defRepoPath := repoFilePath(repoFileName)
+	repoCache := cache.New(cacheName)
+
 	defBaseURL := svnAddrPort
 
-	argMatchAny := flag.Bool("a", false, "select repositories matching any given individual argument")
+	argPattern := &repoPattern{}
+
 	//argBrowse := flag.Bool("b", false, "open Web URL with Web browser")
-	argCaseSen := flag.Bool("c", false, "use case-sensitive matching")
-	argDryRun := flag.Bool("d", false, "do nothing but print commands which would be executed (dry-run)")
-	argRepoFile := flag.String("f", defRepoPath, "use repository definitions from `file`")
-	argLogin := flag.String("l", "", "use `user:pass` to authenticate with REST API")
-	argOutPath := flag.String("o", "", "command output `path` (variables: @=repo, ^=relpath, %=repo/relpath)")
-	argRelPath := flag.String("p", "", "append `path` to all constructed URLs (see NOTES for alternative)")
-	argQuiet := flag.Bool("q", false, "suppress all non-essential and error messages (quiet)")
-	argBaseURL := flag.String("s", defBaseURL, "prepend `server` to all constructed URLs")
-	argUpdate := flag.Bool("u", false, "update repository definitions from server")
-	argWebURL := flag.Bool("w", false, "construct Web URLs instead of repository URLs")
+	argCaseSen := flag.Bool("c", false, "use [case]-sensitive matching")
+	argDryRun := flag.Bool("d", false, "print commands which would be executed ([dry-run])")
+	argRepoFile := flag.String("f", repoCache.FilePath, "use repository definitions from [file] `path`")
+	argLogin := flag.String("l", "", "use `user:pass` to authenticate with SVN or REST API ([login])")
+	argMatchAny := flag.Bool("o", false, "use logical-[or] matching if multiple patterns (-p) given")
+	argQuiet := flag.Bool("q", false, "suppress all non-essential and error messages ([quiet])")
+	flag.Var(argPattern, "r", "select [repositories] matching regex `pattern`")
+	argBaseURL := flag.String("s", defBaseURL, "prepend [server] `url` to all constructed URLs")
+	argUpdate := flag.Bool("u", false, "[update] cached repository definitions from server")
+	argWebURL := flag.Bool("w", false, "construct [web] URLs instead of repository URLs")
 	flag.Usage = func() { usage(flag.CommandLine) }
 
 	flag.Parse()
@@ -120,41 +134,15 @@ func main() {
 		log.SetOutput(io.Discard)
 	} else {
 		log.SetFlags(log.LstdFlags | log.Lmsgprefix)
-		log.SetPrefix("| ")
+		log.SetPrefix("-- ")
 	}
 
-	var expLen, cmdPos int
+	// Keep all arguments other than the first occurrence of "--".
+	cmdArg, nArg := make([]string, flag.NArg()), 0
 	for i, a := range flag.Args() {
-		if a == "--" {
-			if pos := i + 1; flag.NArg() > pos {
-				cmdPos = pos
-			}
-			break
-		}
-		expLen++
-	}
-
-	var expArg, cmdArg []string
-
-	if expLen > 0 {
-		expArg = flag.Args()[:expLen]
-	}
-	if cmdPos > 0 {
-		cmdArg = flag.Args()[cmdPos:]
-	}
-
-	// If user provides a path with "+" prefix anywhere in the command arguments,
-	// use it as the argRelPath flag value. This makes path specification much
-	// more convenient, without having to traverse back to the beginning of the
-	// command line to change paths.
-	for i, s := range cmdArg {
-		if s[0] == '+' && len(s) > 1 {
-			*argRelPath = s[1:]
-			if len(cmdArg) > i+1 {
-				copy(cmdArg[i:], cmdArg[i+1:])
-			}
-			cmdArg = cmdArg[:len(cmdArg)-1]
-			break
+		if i != nArg || a != "--" {
+			cmdArg[nArg] = a
+			nArg++
 		}
 	}
 
@@ -169,141 +157,96 @@ func main() {
 		}
 	}
 
-	list, err := NewRepoList(*argRepoFile, *argUpdate, user, pass)
+	err := repoCache.Sync(*argRepoFile, *argUpdate, user, pass)
 	if nil != err {
 		log.Fatalln(err)
 	}
 
 	*argBaseURL = strings.TrimRight(*argBaseURL, "/")
-	*argRelPath = strings.TrimLeft(*argRelPath, "/")
 
 	urlRoot := svnURLRoot
 	if *argWebURL {
 		urlRoot = webURLRoot
 	}
 
-	procMatch := func(match []string) {
-		if cmdPos == 0 {
-			for _, rep := range match {
-				if *argRelPath != "" {
-					rep = fmt.Sprintf("%s/%s", rep, *argRelPath)
-				}
-				fmt.Printf("%s/%s/%s", *argBaseURL, urlRoot, rep)
-				fmt.Println()
+	listMatch := func(match []string) {
+		for _, repo := range match {
+			fmt.Printf("%s/%s/%s", *argBaseURL, urlRoot, repo)
+			fmt.Println()
+		}
+	}
+
+	runMatch := func(match []string) {
+		for _, repo := range match {
+			url := fmt.Sprintf("%s/%s/%s", *argBaseURL, urlRoot, repo)
+
+			expArg := make([]string, len(cmdArg))
+			for i, s := range cmdArg {
+				expArg[i] = expand(s, url, repo)
 			}
-		} else {
-			for _, rep := range match {
-				var outPath string
-				base := rep
-				if *argRelPath != "" {
-					rep = fmt.Sprintf("%s/%s", rep, *argRelPath)
+			// Print the command line being executed
+			log.Println("| svn " + strings.Join(expArg, " "))
+			if !*argDryRun {
+				out, err := run(expArg...)
+				if out != nil && out.Len() > 0 {
+					fmt.Print(out.String())
 				}
-				repo := fmt.Sprintf("%s/%s/%s", *argBaseURL, urlRoot, rep)
-				if len(match) > 0 {
-					if *argOutPath != "" {
-						outPath = outputPath(*argOutPath, base, *argRelPath)
-					}
-					// Print the command line being executed
-					var sb strings.Builder
-					sb.WriteString("| svn")
-					for _, s := range cmdArg {
-						sb.WriteRune(' ')
-						sb.WriteString(s)
-					}
-					sb.WriteRune(' ')
-					sb.WriteString(repo)
-					if outPath != "" {
-						sb.WriteRune(' ')
-						sb.WriteString(outPath)
-					}
-					log.Println(sb.String())
-				}
-				if !*argDryRun {
-					out, err := run(repo, outPath, cmdArg...)
-					if out != nil && out.Len() > 0 {
-						fmt.Print(out.String())
-					}
-					switch {
-					case errors.Is(err, &exec.ExitError{}):
-						log.Fatalln("error:", string(err.(*exec.ExitError).Stderr))
-					case err != nil:
-						log.Fatalln("error:", err.Error())
-					}
+				switch {
+				case errors.Is(err, &exec.ExitError{}):
+					log.Fatalln("error:", string(err.(*exec.ExitError).Stderr))
+				case err != nil:
+					log.Fatalln("error:", err.Error())
 				}
 			}
 		}
 	}
 
-	if expLen == 0 {
-		// no arguments given, print all known repositories
-		for _, rep := range *list {
-			if *argRelPath != "" {
-				rep = Repo(fmt.Sprintf("%s/%s", rep, *argRelPath))
+	if len(*argPattern) == 0 {
+		if nArg == 0 {
+			// no arguments or patterns given, print all known repositories
+			for _, repo := range repoCache.List {
+				fmt.Printf("%s/%s/%s", *argBaseURL, urlRoot, repo)
+				fmt.Println()
 			}
-			fmt.Printf("%s/%s/%s", *argBaseURL, urlRoot, rep)
-			fmt.Println()
+		} else {
 		}
 	} else {
 		if *argMatchAny {
-			for _, arg := range expArg {
-				match, err := list.matches([]string{arg}, *argCaseSen)
+			for _, arg := range *argPattern {
+				match, err := repoCache.Match([]string{arg}, !*argCaseSen)
 				if nil != err {
 					log.Println("warning: skipping invalid expression:", arg)
 				}
-				procMatch(match)
+				if nArg == 0 {
+					listMatch(match)
+				} else {
+					runMatch(match)
+				}
 			}
 		} else {
-			match, err := list.matches(expArg, *argCaseSen)
+			match, err := repoCache.Match(*argPattern, !*argCaseSen)
 			if nil != err {
 				log.Fatalln("error: invalid expression(s):",
-					"[", strings.Join(expArg, ", "), "]")
+					"[", strings.Join(*argPattern, ", "), "]")
 			}
 			if len(match) == 0 {
 				log.Fatalln("error: no repository found matching expression(s):",
-					"[", strings.Join(expArg, ", "), "]")
+					"[", strings.Join(*argPattern, ", "), "]")
 			}
-			procMatch(match)
+			if nArg == 0 {
+				listMatch(match)
+			} else {
+				runMatch(match)
+			}
 		}
 	}
 }
 
-func outputPath(pattern, repo, relPath string) string {
-	const maxSubs = 100 // surely you can't be serious.
-	sub := map[rune]string{
-		// disallow keywords from infinitely substituting itself. this doesn't
-		// prevent mutually-infinite recursion. don't call me shirley.
-		'@': strings.ReplaceAll(repo, "@", "\\@"),
-		'^': strings.ReplaceAll(relPath, "^", "\\^"),
-		'%': strings.ReplaceAll(filepath.Join(repo, relPath), "%", "\\%"),
+func expand(str string, url, base string) string {
+	for len(str) > 0 && str[0] == '@' {
+		str = url + str[1:]
 	}
-	expand := func(s string) (string, bool) {
-		didExpand := false
-		for k, v := range sub {
-			b := strings.Builder{}
-			e := []rune(s)
-			for i, r := range e {
-				if r == k && (i < 1 || e[i-1] != '\\') {
-					b.WriteString(v)
-					didExpand = true
-				} else {
-					b.WriteRune(r)
-				}
-			}
-			s = b.String()
-		}
-		return s, didExpand
-	}
-	for i := 0; i < maxSubs; i++ {
-		s, didExpand := expand(pattern)
-		if !didExpand {
-			break
-		}
-		pattern = s
-	}
-	for k := range sub {
-		pattern = strings.ReplaceAll(pattern, "\\"+string(k), string(k))
-	}
-	return pattern
+	return strings.ReplaceAll(str, "^", base)
 }
 
 func nonEmpty(arg ...string) []string {
@@ -316,14 +259,9 @@ func nonEmpty(arg ...string) []string {
 	return result
 }
 
-func run(repo, out string, arg ...string) (*strings.Builder, error) {
-	if out != "" {
-		if err := os.MkdirAll(out, 0755); err != nil {
-			return nil, err
-		}
-	}
+func run(arg ...string) (*strings.Builder, error) {
 	var b, e strings.Builder
-	cmd := exec.Command("svn", append(arg, nonEmpty(repo, out)...)...)
+	cmd := exec.Command("svn", nonEmpty(arg...)...)
 	cmd.Stdout = &b
 	cmd.Stderr = &e
 	err := cmd.Run()
@@ -336,178 +274,16 @@ func run(repo, out string, arg ...string) (*strings.Builder, error) {
 	return &b, err
 }
 
-func repoFilePath(name string) string {
-	exists := func(path string) bool {
-		_, err := os.Stat(path)
-		return err == nil
-	}
-	if home, err := os.UserHomeDir(); nil == err {
-		if path := filepath.Join(home, name); exists(path) {
-			return path
-		}
-	}
-	if home, ok := os.LookupEnv("HOME"); ok {
-		if path := filepath.Join(home, name); exists(path) {
-			return path
-		}
-	}
-	if exe, err := os.Executable(); nil == err {
-		if path := filepath.Join(filepath.Dir(exe), name); exists(path) {
-			return path
-		}
-	}
-	if pwd, err := os.Getwd(); nil == err {
-		if path := filepath.Join(pwd, name); exists(path) {
-			return path
-		}
-	}
-	return filepath.Join(".", name)
+type wordWrap struct {
+	column      int
+	indent      string
+	caption     string
+	indentFirst bool
 }
 
-func cachedCredentials() (user string, pass string, err error) {
-	c := exec.Command("svn", "auth", "--show-passwords", cacheName)
-	r, err := regexp.Compile(`(?mi)^(Password|Username):\s*(.*)$`)
-	if nil != err {
-		return "", "", err
-	}
-	e := errors.New("SVN credentials not cached (see -h for help authenticating)")
-	o, err := c.CombinedOutput()
-	if nil != err {
-		return "", "", e
-	}
-	s := r.FindAllSubmatch(o, 2)
-	if s == nil {
-		return "", "", e
-	}
-	for _, u := range s {
-		switch strings.ToLower(string(u[1])) {
-		case "username":
-			user = string(u[2])
-		case "password":
-			pass = string(u[2])
-		}
-	}
-	return
-}
-
-func updateRepoFile(filePath string, user string, pass string) (*os.File, error) {
-
-	api := resty.New().
-		SetDisableWarn(true).
-		SetRetryCount(3).
-		SetHostURL(apiAddrPort + "/" + apiURLRoot)
-
-	if user == "" && pass == "" {
-		var err error
-		user, pass, err = cachedCredentials()
-		if nil != err {
-			return nil, err
-		}
-	}
-	api.SetBasicAuth(user, pass)
-
-	resp := apiRespRepo{}
-	_, err := api.R().
-		SetHeader("Accept", "application/"+apiFormat).
-		SetQueryParams(map[string]string{"format": apiFormat}).
-		SetResult(&resp).
-		Get("/repository")
-	if nil != err {
-		return nil, err
-	}
-	log.Printf("received %d repositories\n", len(resp.Repo))
-
-	// first write the response to a temporary file and then move it in place of
-	// our selected repo definitions file. in case of an error, we won't lose an
-	// existing repo definitions file.
-	repoFile, err := os.CreateTemp("", repoFileName)
-	if nil != err {
-		return nil, err
-	}
-	defer repoFile.Close()
-
-	for _, r := range resp.Repo {
-		if _, err := fmt.Fprintln(repoFile, r.Name); nil != err {
-			return nil, err
-		}
-	}
-
-	return repoFile, nil
-}
-
-type Repo string
-type RepoList []Repo
-
-func NewRepoList(filePath string, update bool, user string, pass string) (*RepoList, error) {
-
-	if update {
-		// write all repos to a new temporary file
-		tmp, err := updateRepoFile(filePath, user, pass)
-		if nil != err {
-			return nil, err
-		}
-		// ensure our target repo file path exists
-		if err := os.MkdirAll(filepath.Dir(filePath), fs.ModePerm); nil != err {
-			return nil, err
-		}
-		// move the temporary file in place of our given definitions file
-		os.Rename(tmp.Name(), filePath)
-	}
-
-	file, err := os.Open(filePath)
-	if nil != err {
-		return nil, err
-	}
-	defer file.Close()
-
-	list := RepoList{}
-	scan := bufio.NewScanner(file)
-
-	for scan.Scan() {
-		list = append(list, Repo(scan.Text()))
-	}
-
-	if err := scan.Err(); nil != err {
-		return nil, err
-	}
-
-	return &list, nil
-}
-
-func (l *RepoList) matches(pat []string, sen bool) ([]string, error) {
-
-	exp := make([]*regexp.Regexp, len(pat))
-	for i, p := range pat {
-		if !sen {
-			p = "(?i)" + p
-		}
-		e, err := regexp.Compile(p)
-		if err != nil {
-			return nil, err
-		}
-		exp[i] = e
-	}
-
-	m := []string{}
-	for _, rep := range *l {
-		match := false
-		for _, e := range exp {
-			if match = e.MatchString(string(rep)); !match {
-				break
-			}
-		}
-		if match {
-			m = append(m, string(rep))
-		}
-	}
-
-	return m, nil
-}
-
-func ln(word ...string) string {
+func (ww *wordWrap) wrap(word ...string) string {
 	var sb strings.Builder
 	var rp []rune
-	var pp bool
 	for i, w := range word {
 		if len(w) > 0 {
 			// No visible symbols exist after this word
@@ -528,11 +304,10 @@ func ln(word ...string) string {
 				if !first && !punct && !wsBeg && !wsEnd {
 					sb.WriteRune(' ')
 				}
-				if pp = punct; pp {
+				if punct {
 					sb.WriteString(t)
 				} else {
 					if last {
-						// Trim trailing whitespace from last word
 						sb.WriteString(w[:strings.LastIndex(w, t)+len(t)])
 					} else {
 						sb.WriteString(w)
@@ -545,5 +320,50 @@ func ln(word ...string) string {
 			}
 		}
 	}
-	return strings.TrimRight(sb.String(), "\r\n") + newline
+	var lb strings.Builder
+	var ls string
+	var ln int
+	if ww.indentFirst {
+		ls = ww.indent
+	} else {
+		if ww.caption != "" {
+			ls = ww.caption
+		} else {
+			for _, c := range sb.String() {
+				if !unicode.IsSpace(c) {
+					break
+				}
+				ls += string(c)
+			}
+		}
+	}
+	lf := strings.Fields(sb.String())
+	for i, w := range lf {
+		if len(ls)+len(w) >= ww.column {
+			lb.WriteString(ls + newline)
+			ls = ww.indent
+			ln++
+			if len(ww.indent)+len(w) >= ww.column {
+				ml := ww.column - len(ww.indent) - 1
+				for j := 0; j < len(w); j += ml {
+					if ml > len(w[j:]) {
+						ls += w[j:]
+						break
+					}
+					lb.WriteString(ww.indent + w[j:ml] + "-" + newline)
+					ln++
+				}
+				break
+			}
+		} else {
+			if i > 0 {
+				ls += " "
+			}
+		}
+		ls += w
+	}
+	if ls != ww.indent {
+		lb.WriteString(ls + newline)
+	}
+	return strings.TrimRight(lb.String(), "\r\n") + newline
 }
