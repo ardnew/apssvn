@@ -33,21 +33,6 @@ const (
 	svnURLRoot  = "svn"
 )
 
-type repoPattern []string
-
-func (rp *repoPattern) Set(s string) error {
-	if rp == nil {
-		*rp = repoPattern{s}
-	} else {
-		*rp = append(*rp, s)
-	}
-	return nil
-}
-
-func (rp *repoPattern) String() string {
-	return "[ " + strings.Join(*rp, ", ") + " ]"
-}
-
 const newline = "\r\n"
 
 func exeName() string {
@@ -62,7 +47,7 @@ func usage(set *flag.FlagSet) {
 	fmt.Printf("%s %s %s %s@%s %s"+newline,
 		IMPORT, VERSION, PLATFORM, BRANCH, REVISION, BUILDTIME)
 	fmt.Println("USAGE")
-	fmt.Printf(ww.wrap(exeName(), "[flags] [-- svn-command-line ...]"))
+	fmt.Printf(ww.wrap(exeName(), "[flags] [repo-pattern ...] [-- svn-command-line ...]"))
 	fmt.Println()
 	fmt.Println("FLAGS (mnemonics shown in [brackets])")
 	// Determine the maximum width of the left-hand side containing "-x foo" among
@@ -90,8 +75,9 @@ func usage(set *flag.FlagSet) {
 	fmt.Printf(ww.wrap("All arguments following the first occurrence of \"--\" are",
 		"forwarded (in the same order they were given) to each \"svn\" command",
 		"generated. Since the same command may run with multiple repositories,",
-		"placeholder variables are used in the given command line and substituted",
-		"with attributes from each target repository:"))
+		"placeholder variables may be used in the given command line, which are then",
+		"substituted with attributes from the target repository each time the \"svn\"",
+		"command is run."))
 	fmt.Println()
 	ww.indent = "      "
 	fmt.Printf(ww.wrap("@ = repository URL (must be first character in word)"))
@@ -99,10 +85,11 @@ func usage(set *flag.FlagSet) {
 	ww.indent = "  "
 	fmt.Println()
 	fmt.Printf(ww.wrap("For example, exporting a common tag from all repositories",
-		"with \"DAPA\" in the name into respectively-named subdirectories:"))
+		"with \"DAPA\" in the name into respectively-named subdirectories of the",
+		"current directory:"))
 	fmt.Println()
 	ww.indent = "      "
-	fmt.Printf(ww.wrap("%%", exeName(), "-r DAPA -- export @/tags/foo ^/tags/foo"))
+	fmt.Printf(ww.wrap("%%", exeName(), "DAPA", "--", "export @/tags/foo ./^/tags/foo"))
 	ww.indent = "  "
 	fmt.Println()
 }
@@ -113,16 +100,13 @@ func main() {
 
 	defBaseURL := svnAddrPort
 
-	argPattern := &repoPattern{}
-
 	//argBrowse := flag.Bool("b", false, "open Web URL with Web browser")
 	argCaseSen := flag.Bool("c", false, "use [case]-sensitive matching")
 	argDryRun := flag.Bool("d", false, "print commands which would be executed ([dry-run])")
 	argRepoFile := flag.String("f", repoCache.FilePath, "use repository definitions from [file] `path`")
 	argLogin := flag.String("l", "", "use `user:pass` to authenticate with SVN or REST API ([login])")
-	argMatchAny := flag.Bool("o", false, "use logical-[or] matching if multiple patterns (-p) given")
+	argMatchAny := flag.Bool("o", false, "use logical-[or] matching if multiple patterns given")
 	argQuiet := flag.Bool("q", false, "suppress all non-essential and error messages ([quiet])")
-	flag.Var(argPattern, "r", "select [repositories] matching regex `pattern`")
 	argBaseURL := flag.String("s", defBaseURL, "prepend [server] `url` to all constructed URLs")
 	argUpdate := flag.Bool("u", false, "[update] cached repository definitions from server")
 	argWebURL := flag.Bool("w", false, "construct [web] URLs instead of repository URLs")
@@ -138,11 +122,14 @@ func main() {
 	}
 
 	// Keep all arguments other than the first occurrence of "--".
-	cmdArg, nArg := make([]string, flag.NArg()), 0
-	for i, a := range flag.Args() {
-		if i != nArg || a != "--" {
-			cmdArg[nArg] = a
-			nArg++
+	patArg := []string{}
+	cmdArg := []string{}
+	ptrArg := &patArg
+	for _, a := range flag.Args() {
+		if strings.TrimSpace(a) == "--" {
+			ptrArg = &cmdArg
+		} else {
+			*ptrArg = append(*ptrArg, a)
 		}
 	}
 
@@ -201,8 +188,8 @@ func main() {
 		}
 	}
 
-	if len(*argPattern) == 0 {
-		if nArg == 0 {
+	if len(patArg) == 0 {
+		if len(cmdArg) == 0 {
 			// no arguments or patterns given, print all known repositories
 			for _, repo := range repoCache.List {
 				fmt.Printf("%s/%s/%s", *argBaseURL, urlRoot, repo)
@@ -212,28 +199,28 @@ func main() {
 		}
 	} else {
 		if *argMatchAny {
-			for _, arg := range *argPattern {
+			for _, arg := range patArg {
 				match, err := repoCache.Match([]string{arg}, !*argCaseSen)
 				if nil != err {
 					log.Println("warning: skipping invalid expression:", arg)
 				}
-				if nArg == 0 {
+				if len(cmdArg) == 0 {
 					listMatch(match)
 				} else {
 					runMatch(match)
 				}
 			}
 		} else {
-			match, err := repoCache.Match(*argPattern, !*argCaseSen)
+			match, err := repoCache.Match(patArg, !*argCaseSen)
 			if nil != err {
 				log.Fatalln("error: invalid expression(s):",
-					"[", strings.Join(*argPattern, ", "), "]")
+					"[", strings.Join(patArg, ", "), "]")
 			}
 			if len(match) == 0 {
 				log.Fatalln("error: no repository found matching expression(s):",
-					"[", strings.Join(*argPattern, ", "), "]")
+					"[", strings.Join(patArg, ", "), "]")
 			}
-			if nArg == 0 {
+			if len(cmdArg) == 0 {
 				listMatch(match)
 			} else {
 				runMatch(match)
