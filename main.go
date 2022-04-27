@@ -82,6 +82,9 @@ func usage(set *flag.FlagSet) {
 	ww.indent = "      "
 	fmt.Printf(ww.wrap("@ = repository URL (must be first character in word)"))
 	fmt.Printf(ww.wrap("^ = repository base name"))
+	fmt.Printf(ww.wrap("& = preceding URL/path argument"))
+	fmt.Printf(ww.wrap("$ = last path component (basename) of \"&\""))
+	fmt.Printf(ww.wrap("! = parent path component (basename of dirname) of \"&\""))
 	ww.indent = "  "
 	fmt.Println()
 	fmt.Printf(ww.wrap("For example, exporting a common tag from all repositories",
@@ -169,10 +172,25 @@ func main() {
 
 			expArg := make([]string, len(cmdArg))
 			for i, s := range cmdArg {
-				expArg[i] = expand(s, url, repo)
+				prec := ""
+				if i > 0 {
+					prec = expArg[i-1]
+				}
+				expArg[i] = expand(s, url, repo, prec)
 			}
 			// Print the command line being executed
-			log.Println("| svn " + strings.Join(expArg, " "))
+			var cli strings.Builder
+			for i, s := range expArg {
+				if i > 0 {
+					cli.WriteRune(' ')
+				}
+				if strings.ContainsAny(s, " \t\n$&|<>;`~#{}[]*?!") {
+					cli.WriteString("'" + s + "'")
+				} else {
+					cli.WriteString(s)
+				}
+			}
+			log.Println("| svn " + cli.String())
 			if !*argDryRun {
 				out, err := run(expArg...)
 				if out != nil && out.Len() > 0 {
@@ -229,11 +247,15 @@ func main() {
 	}
 }
 
-func expand(str string, url, base string) string {
+func expand(str string, url, base, prec string) string {
 	for len(str) > 0 && str[0] == '@' {
 		str = url + str[1:]
 	}
-	return strings.ReplaceAll(str, "^", base)
+	bn := filepath.Base(prec)
+	pn := filepath.Base(filepath.Dir(prec))
+	fmt.Printf("url=%q, base=%q, prec=%q, bn=%q, pn=%q\n", url, base, prec, bn, pn)
+	return strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(
+		strings.ReplaceAll(str, "^", base), "&", prec), "$", bn), "!", pn)
 }
 
 func nonEmpty(arg ...string) []string {

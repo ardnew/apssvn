@@ -1,5 +1,6 @@
 go.sum
 run.sh
 bin
+dist
 .gdb_history
 .Makefile.targets
